@@ -1,7 +1,10 @@
 import re
 
 api_path = "/home/mark/blasfeo/include/blasfeo_d_blasfeo_api.h"
+api_path = "/home/mark/blasfeo/include/blasfeo_d_aux.h"
 pattern = r"^(double|void) blasfeo_(?P<funcname>[a-zA-Z_]+)[(](?P<args>[^)]*)[)]"
+
+remove_d = False
 
 def try_parse_basic_index(argname):
     if argname[-1] in ["i", "j"]:
@@ -157,7 +160,9 @@ def get_wrapped_impl(funcname, args, arginfos):
             zigvars_list.append(argname)
 
     zigvars = ", ".join(zigvars_list)
-    return f'{{ cblasfeo.blasfeo_d{funcname}({zigvars}); }}'
+
+    d = "d" if remove_d else ""
+    return f'{{ cblasfeo.blasfeo_{d}{funcname}({zigvars}); }}'
 
 with open(api_path, "r") as f:
     for line in f.readlines():
@@ -169,12 +174,16 @@ with open(api_path, "r") as f:
         returntype = match.group(1)
         funcname = (match.group('funcname'))
         if funcname.startswith('cm_'):
-            # skip complex
+            # skip complex? column major?
             continue
 
-        assert funcname.startswith('d')
-        funcname = funcname[1:]
-        
+        if funcname.startswith("pm_"):
+            # skip explicit panel major
+            continue
+
+        if funcname.startswith('d') and remove_d:
+            funcname = funcname[1:]
+
         args = [a.strip() for a in (match.group('args')).split(",")]
         args = [a.split(" ")[-2:] for a in args]
 
