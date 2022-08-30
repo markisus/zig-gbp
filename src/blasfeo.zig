@@ -8,10 +8,13 @@ const cblasfeo = @cImport({
     @cInclude("blasfeo_d_blasfeo_ref_api.h");
 });
 
-const CACHE_LINE_SIZE = cblasfeo.CACHE_LINE_SIZE;
+pub const CACHE_LINE_SIZE = cblasfeo.CACHE_LINE_SIZE;
+
+pub const Dmat = cblasfeo.blasfeo_dmat;
+pub const Dvec = cblasfeo.blasfeo_dvec;
 
 // A view of a blasfeo matrix
-const Matrix = struct {
+pub const Matrix = struct {
     const Self = @This();
 
     dmat: *cblasfeo.blasfeo_dmat = undefined,
@@ -26,7 +29,7 @@ const Matrix = struct {
 };
 
 // A view of blasfeo vector
-const Vector = struct {
+pub const Vector = struct {
     const Self = @This();
 
     dvec: *cblasfeo.blasfeo_dvec,
@@ -47,6 +50,14 @@ const Vector = struct {
     }
 };
 
+pub fn memsize_mat(m: c_int, n: c_int) usize {
+    return cblasfeo.blasfeo_memsize_dmat(m, n);
+}
+// returns the memory size (in bytes) needed for a dvec
+pub fn memsize_vec(m: c_int) usize {
+    return cblasfeo.blasfeo_memsize_dvec(m);
+}
+
 pub fn axpy(alpha: f64, x: Vector, y: Vector, z: Vector) void {
     cblasfeo.blasfeo_daxpy(x.len, alpha, x.dvec, x.start, y.dvec, y.start, z.dvec, z.start);
 }
@@ -59,10 +70,10 @@ pub fn vecmul(x: Vector, y: Vector, z: Vector) void {
 pub fn vecmulacc(x: Vector, y: Vector, z: Vector) void {
     cblasfeo.blasfeo_dvecmulacc(x.len, x.dvec, x.start, y.dvec, y.start, z.dvec, z.start);
 }
-pub fn vecmuldot(x: Vector, y: Vector, z: Vector) double {
+pub fn vecmuldot(x: Vector, y: Vector, z: Vector) f64 {
     cblasfeo.blasfeo_dvecmuldot(x.len, x.dvec, x.start, y.dvec, y.start, z.dvec, z.start);
 }
-pub fn dot(x: Vector, y: Vector) double {
+pub fn dot(x: Vector, y: Vector) f64 {
     cblasfeo.blasfeo_ddot(x.len, x.dvec, x.start, y.dvec, y.start);
 }
 pub fn rotg(a: f64, b: f64, c: *f64, s: *f64) void {
@@ -309,11 +320,11 @@ pub fn gelqf_pd_lla(n1: c_int, L0: Matrix, L1: Matrix, A: Matrix, work: *anyopaq
     cblasfeo.blasfeo_dgelqf_pd_lla(L0.rows, n1, L0.dmat, L0.row_start, L0.col_start, L1.dmat, L1.row_start, L1.col_start, A.dmat, A.row_start, A.col_start, work);
 }
 
-pub fn create_dmat(A: Matrix, memory: *anyopaque) void {
-    cblasfeo.blasfeo_create_dmat(A.rows, A.cols, A.dmat, memory);
+pub fn create_dmat(m: c_int, n: c_int, dmat: *Dmat, memory: *anyopaque) void {
+    cblasfeo.blasfeo_create_dmat(m, n, dmat, memory);
 }
-pub fn create_dvec(A: Vector, memory: *anyopaque) void {
-    cblasfeo.blasfeo_create_dvec(A.len, A.dvec, memory);
+pub fn create_dvec(m: c_int, dvec: *Dvec, memory: *anyopaque) void {
+    cblasfeo.blasfeo_create_dvec(m, dvec, memory);
 }
 pub fn pack_dmat(A: *f64, lda: c_int, B: Matrix) void {
     cblasfeo.blasfeo_pack_dmat(B.rows, B.cols, A, lda, B.dmat, B.row_start, B.col_start);
