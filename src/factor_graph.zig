@@ -43,25 +43,21 @@ pub fn allocMats(allocator: std.mem.Allocator, dim: c_int, dmats: []*blasfeo.Dma
 
 var ARENA = blasfeo.Arena.init(std.heap.c_allocator);
 
-pub fn infoToCov(info_vec: blasfeo.Vector, info_mat: blasfeo.Matrix, mean: blasfeo.Vector, cov: blasfeo.Matrix) !void {
-    try ARENA.pushEnv();
-    defer ARENA.popEnv();
-
-    var chol = try ARENA.matrix(cov.rows, cov.rows);
-    blasfeo.potrf_l(info_mat, chol);
-
+pub fn convertGaussianRepChol(info_vec: blasfeo.Vector, info_chol: blasfeo.Matrix, mean: blasfeo.Vector, cov: blasfeo.Matrix) !void {
     blasfeo.gese(0.0, cov);
     blasfeo.diare(1.0, cov);
-    blasfeo.trsm_llnn(1.0, chol, cov, cov);
-    blasfeo.trsm_lltn(1.0, chol, cov, cov);
-
-    blasfeo.trsv_lnn(chol, info_vec, mean);
-    blasfeo.trsv_ltn(chol, mean, mean);
+    blasfeo.trsm_llnn(1.0, info_chol, cov, cov);
+    blasfeo.trsm_lltn(1.0, info_chol, cov, cov);
+    blasfeo.trsv_lnn(info_chol, info_vec, mean);
+    blasfeo.trsv_ltn(info_chol, mean, mean);
 }
 
-pub fn covToInfo(mean: blasfeo.Vector, cov: blasfeo.Matrix, info_vec: blasfeo.Vector, info_mat: blasfeo.Matrix) !void {
-    // actually this is the same function as infoToCov
-    try infoToCov(mean, cov, info_vec, info_mat);
+pub fn convertGaussianRep(info_vec: blasfeo.Vector, info_mat: blasfeo.Matrix, mean: blasfeo.Vector, cov: blasfeo.Matrix) !void {
+    try ARENA.pushEnv();
+    defer ARENA.popEnv();
+    var chol = try ARENA.matrix(cov.rows, cov.rows);
+    blasfeo.potrf_l(info_mat, chol);
+    try convertGaussianRepChol(info_vec, chol, mean, cov);
 }
 
 const FactorGraph = struct {
@@ -81,6 +77,7 @@ const FactorGraph = struct {
         prior_info_dmat: blasfeo.Dmat = undefined,
         first_factor_slot : ?usize = null,
         last_factor_slot : ?usize = null,
+        needs_fix: bool = false,
 
         pub fn mean(self: *Variable) blasfeo.Vector {
             return blasfeo.Vector.attach(&self.mean_dvec);
@@ -121,12 +118,55 @@ const FactorGraph = struct {
             vcov.setFromSlice(prior_cov);
             vmean.setFromSlice(prior_mean);
 
+            var chol = try ARENA.matrix(dim, dim);
+            blasfeo.potrf_l(vcov, chol);
+            self.cov_det = std.math.pow(f64, blasfeo.diagonalProduct(chol), 2);
+
             // set prior info vec/mat
-            try covToInfo(vmean, vcov, vprior_info_vec, vprior_info_mat);
+            try convertGaussianRepChol(vmean, chol, vprior_info_vec, vprior_info_mat);
 
             // copy values into the current info and prior vec
             blasfeo.veccp(vprior_info_vec, vinfo_vec);
             blasfeo.gecp(vprior_info_mat, vinfo_mat);
+        }
+
+        pub fn fixMeanCovKl(self: *Variable) !void {
+            // after updating the info mat and info vec
+            // call this function to update the mean, cov, and kl
+            // convert from info form to covariance form
+            
+            var info_chol = try ARENA.matrix(self.dim, self.dim);
+            blasfeo.potrf_l(self.info_mat(), info_chol);
+            var new_cov_det = std.math.pow(f64, 1.0/blasfeo.diagonalProduct(info_chol), 2);
+            var new_mean = try ARENA.vector(self.dim);
+            var new_cov = try ARENA.matrix(self.dim, self.dim);
+            try convertGaussianRepChol(
+                self.info_vec(), info_chol,
+                new_mean, new_cov);
+
+            // compute the KL divergence between previous
+            // https://mr-easy.github.io/2020-04-16-kl-divergence-between-2-gaussian-distributions/
+            // p = prev, q = current
+            var delta = try ARENA.vector(self.dim);
+            var infoq_delta = try ARENA.vector(self.dim);
+            var infoq_sigmap = try ARENA.matrix(self.dim, self.dim);
+
+            blasfeo.axpy(-1.0, new_mean, self.mean(), delta);
+            blasfeo.gemv_n(1.0, self.info_mat(), delta, 0.0, delta, infoq_delta);
+            var deltat_infoq_delta = blasfeo.dot(delta, infoq_delta);
+
+            blasfeo.gemm_nn(1.0, self.info_mat(), self.cov(), 0.0, self.cov(), infoq_sigmap);
+            const tr_infoq_sigmap = blasfeo.trace(infoq_sigmap);
+            const covdet_ratio = new_cov_det / self.cov_det;
+            const ln_covdet_ratio = std.math.ln(covdet_ratio);
+
+            const kl = 0.5 * (ln_covdet_ratio - @intToFloat(f64, self.dim) + deltat_infoq_delta + tr_infoq_sigmap);
+            self.kl_divergence = kl;
+            self.cov_det = new_cov_det;
+            blasfeo.veccp(new_mean, self.mean());
+            blasfeo.gecp(new_cov, self.cov());
+
+            self.needs_fix = false;
         }
     };
 
@@ -267,6 +307,7 @@ const FactorGraph = struct {
     factors: std.ArrayList(Factor),
     factor_slots: std.ArrayList(FactorSlot),
     variables: std.ArrayList(Variable),
+    propagate_variable_tmp: std.ArrayList(usize),
 
     pub fn init(allocator: std.mem.Allocator) Self {
         var self: Self = undefined;
@@ -274,6 +315,7 @@ const FactorGraph = struct {
         self.factors = std.ArrayList(Factor).init(allocator);
         self.factor_slots = std.ArrayList(FactorSlot).init(allocator);
         self.variables = std.ArrayList(Variable).init(allocator);
+        self.propagate_variable_tmp = std.ArrayList(usize).init(allocator);
         return self;
     }
 
@@ -281,6 +323,7 @@ const FactorGraph = struct {
         self.factors.deinit();
         self.factor_slots.deinit();
         self.variables.deinit();
+        self.propagate_variable_tmp.deinit();
     }
 
     pub fn variableFactorsIterator(self: *Self, variable_id: usize) VariableFactorIterator {
@@ -414,13 +457,13 @@ const FactorGraph = struct {
     }
 
     pub fn propagateVariable(self: *Self, variable_id: usize) !void {
+        defer self.propagate_variable_tmp.clearRetainingCapacity();
+
         const variable = &self.variables.items[variable_id];
         if (variable.first_factor_slot == null) {
             // this variable is not involved with any factors
             return;
         }
-
-        // std.debug.print("Propagating var {d}\n", .{variable.id});
 
         var next_slot: ?*FactorSlot = &self.factor_slots.items[variable.first_factor_slot.?];
         while (next_slot != null) {
@@ -435,7 +478,6 @@ const FactorGraph = struct {
             defer ARENA.popEnv();
 
             var factor = &self.factors.items[slot.factor_id];
-            // std.debug.print("Sending message to factor {d}\n", .{factor.id});
 
             // update the to-factor message from this variable
             // this is the variable info minus the info that it got from this slot
@@ -443,11 +485,6 @@ const FactorGraph = struct {
             blasfeo.gead(-1.0, slot.to_variable_mat(), slot.from_variable_mat());
             blasfeo.veccp(variable.info_vec(), slot.from_variable_vec());
             blasfeo.vecad(-1.0, slot.to_variable_vec(), slot.from_variable_vec());
-
-            // std.debug.print("Info vec\n", .{});
-            // blasfeo.print_vec(slot.from_variable_vec());
-            // std.debug.print("Info mat\n", .{});
-            // blasfeo.print_mat(slot.from_variable_mat());
 
             // incorporate the to-factor message into the factor info
             var info_block = factor.info_mat().block(slot.dim_offset, slot.dim_offset, variable.dim, variable.dim);
@@ -459,11 +496,6 @@ const FactorGraph = struct {
             var info_base_segment = factor.info_base_vec().segment(slot.dim_offset, variable.dim);
             blasfeo.veccp(info_base_segment, info_segment);
             blasfeo.vecad(1.0, slot.from_variable_vec(), info_segment);
-
-            // std.debug.print("Updated Factor Info vec\n", .{});
-            // blasfeo.print_vec(factor.info_vec());
-            // std.debug.print("Updated Factor Info mat\n", .{});
-            // blasfeo.print_mat(factor.info_mat());
 
             // marginalize out every other slot
             var work_mat = try ARENA.matrix(factor.dim, factor.dim);
@@ -489,41 +521,30 @@ const FactorGraph = struct {
                     work_vec.segment(other_slot.dim_offset, other_dim)
                 );
 
-                try infoToCov(work_vec, work_mat, work_vec, work_mat_inv);
+                try convertGaussianRep(work_vec, work_mat, work_vec, work_mat_inv);
                 
                 // retreive the block
                 var work_block = work_mat_inv.block(other_slot.dim_offset, other_slot.dim_offset, other_dim, other_dim);
                 var work_segment = work_vec.segment(other_slot.dim_offset, other_dim);
-                try covToInfo(work_segment, work_block, other_slot.to_variable_vec(), other_slot.to_variable_mat());
+                try convertGaussianRep(work_segment, work_block, other_slot.to_variable_vec(), other_slot.to_variable_mat());
 
                 // add the message into the other variable
                 var other_variable = &self.variables.items[other_slot.variable_id];
                 blasfeo.vecad(1.0, other_slot.to_variable_vec(), other_variable.info_vec());
                 blasfeo.gead(1.0, other_slot.to_variable_mat(), other_variable.info_mat());
 
-                // convert from info form to covariance form
-                var other_mean = other_variable.mean();
-                var other_cov = other_variable.cov();
-                try infoToCov(other_variable.info_vec(),
-                              other_variable.info_mat(),
-                              other_mean,
-                              other_cov);
-                
-                // // compute the KL divergence between previous
-                // // https://mr-easy.github.io/2020-04-16-kl-divergence-between-2-gaussian-distributions/
-                // // p = prev, q = current
-                // var delta = try ARENA.vector(other_variable.dim);
-                // var infoq_delta = try ARENA.vector(other_variable.dim);
-                // var infoq_sigmap = try ARENA.matrix(other_variable.dim, other_variable.dim);
-
-                // blasfeo.axpy(-1.0, msg_mean, other_variable.mean(), delta);
-                // blasfeo.gemv_n(1.0, other_variable.info_mat(), delta, 0.0, delta, infoq_delta);
-                // var deltat_infoq_delta = blasfeo.dot(delta, infoq_delta);
-
-                // blasfeo.gemm_nn(1.0, other_variable.info_mat(), other_variable.cov(), 0.0, other_variable.cov(), infoq_sigmap);
-                // const tr_infoq_sigmap = blasfeo.trace(infoq_sigmap);
-                // const kl = 0.5 * (std.math.ln(msg_cov_det / variable.cov_det) - @intToFloat(f64, other_variable.dim) + deltat_infoq_delta + tr_infoq_sigmap);
+                if (!other_variable.needs_fix) {
+                    try self.propagate_variable_tmp.append(other_variable.id);
+                    other_variable.needs_fix = true;
+                }
             }
+        }
+
+        // fix those variables whose states have changed
+        for (self.propagate_variable_tmp.items) |vid| {
+            // std.debug.print("Fixing {d}\n", .{vid});
+            var v = &self.variables.items[vid];
+            try v.fixMeanCovKl();
         }
     }
 };
@@ -737,35 +758,35 @@ test "propagate two variables" {
     blasfeo.print_mat(info_mat);
     std.debug.print("Info vec\n", .{});
     blasfeo.print_vec(info_vec);
-    
+
     factor.relinearize(info_vec, info_mat);
     std.debug.print("Factor info initialized to:\n", .{});
     blasfeo.print_mat(factor.info_mat());
     // zig fmt: on
 
+    std.debug.print("Cov dets before {d} {d}\n", .{ v0.cov_det, v1.cov_det });
     var it: usize = 0;
-    while (it < 1) : (it += 1) {
+    while (it < 10) : (it += 1) {
+        std.debug.print("it {d}\n", .{it});
         try graph.propagateVariable(v0.id);
         try graph.propagateVariable(v1.id);
         std.debug.print("New v0 mean\n", .{});
         blasfeo.print_vec(v0.mean());
+        // std.debug.print("New v0 cov\n", .{});
+        // blasfeo.print_mat(v0.cov());
+        std.debug.print("kl v0: {d}\n", .{v0.kl_divergence});
         std.debug.print("New v1 mean\n", .{});
         blasfeo.print_vec(v1.mean());
+        // std.debug.print("New v1 cov\n", .{});
+        // blasfeo.print_mat(v1.cov());
+        std.debug.print("kl v1: {d}\n", .{v1.kl_divergence});
+        // std.debug.print("Cov dets {d} {d}\n", .{ v0.cov_det, v1.cov_det });
     }
+    std.debug.print("New v0 mean\n", .{});
+    blasfeo.print_vec(v0.mean());
+    std.debug.print("New v1 mean\n", .{});
+    blasfeo.print_vec(v1.mean());
 
     // std.debug.print("New v0 cov\n", .{});
     // blasfeo.print_mat(v0.cov());
 }
-
-// test "allocVecs" {
-//     var dvec1: blasfeo.Dvec = undefined;
-//     var dvec2: blasfeo.Dvec = undefined;
-//     var dvecs: [2]*blasfeo.Dvec = .{ &dvec1, &dvec2 };
-//     try allocVecs(std.heap.c_allocator, 4, &dvecs);
-//     for (dvecs) |dvec| {
-//         try std.testing.expect(dvec.mem != 0);
-//         if (dvec.mem != 0) {
-//             std.heap.c_allocator.destroy(dvec.mem);
-//         }
-//     }
-// }
