@@ -1,9 +1,6 @@
 const std = @import("std");
 const cblasfeo = @cImport({
     // todo: coordinate these values
-    @cDefine("LA_HIGH_PERFORMANCE", "");
-    @cDefine("MF_PANELMAJ", "");
-    @cDefine("CACHE_LINE_SIZE", "64");
     @cInclude("blasfeo.h");
     @cInclude("blasfeo_d_blasfeo_ref_api.h");
 });
@@ -12,6 +9,10 @@ pub const CACHE_LINE_SIZE = cblasfeo.CACHE_LINE_SIZE;
 
 pub const Dmat = cblasfeo.blasfeo_dmat;
 pub const Dvec = cblasfeo.blasfeo_dvec;
+
+pub fn removeConst(comptime T: type, ptr: *const T) *T {
+    return @intToPtr(*T, @ptrToInt(ptr));
+}
 
 // A view of a blasfeo matrix
 pub const Matrix = struct {
@@ -23,8 +24,17 @@ pub const Matrix = struct {
     rows: c_int = 0,
     cols: c_int = 0,
 
+    pub fn attach(dmat: *Dmat) Matrix {
+        return Matrix{ .dmat = dmat, .rows = dmat.m, .cols = dmat.n };
+    }
+
     pub fn block(self: *Self, row_start_1: c_int, col_start_1: c_int, rows_1: c_int, cols_1: c_int) Matrix {
         return .{ .dmat = self.dmat, .row_start = self.row_start + row_start_1, .col_start = self.col_start + col_start_1, .rows = rows_1, .cols = cols_1 };
+    }
+
+    pub fn setFromSlice(self: *Self, data: []const f64) void {
+        std.debug.assert(data.len == self.rows * self.cols);
+        pack_tran_dmat(removeConst(f64, &data.ptr[0]), self.cols, self.*);
     }
 };
 
@@ -36,7 +46,11 @@ pub const Vector = struct {
     len: c_int = 0,
     start: c_int = 0,
 
-    pub fn segment(self: *const Self, len_1: c_int, start_1: c_int) Vector {
+    pub fn attach(dvec: *Dvec) Vector {
+        return Vector{ .dvec = dvec, .len = dvec.m };
+    }
+
+    pub fn segment(self: *const Self, start_1: c_int, len_1: c_int) Vector {
         std.debug.assert(0 <= start_1 and start_1 + len_1 <= self.len);
         return .{ .dvec = self.dvec, .len = len_1, .start = self.start + start_1 };
     }
@@ -48,7 +62,87 @@ pub const Vector = struct {
         std.debug.assert(len_1 <= self.len);
         return .{ .dvec = self.dvec, .len = len_1, .start = self.start + self.len - len_1 };
     }
+
+    pub fn setFromSlice(self: *Self, data: []const f64) void {
+        std.debug.assert(data.len == self.len);
+        pack_dvec(removeConst(f64, &data.ptr[0]), 1, self.*);
+    }
 };
+
+pub fn matel(matrix: Matrix, ai_: c_int, aj_: c_int) f64 {
+    // manual translation of DMATEL under MF_PANELMAJ & LA_HIGH_PERFORMANCE
+    // #define BLASFEO_DMATEL(sA,ai,aj) ((sA)->pA[((ai)-((ai)&(D_PS-1)))*(sA)->cn+(aj)*D_PS+((ai)&(D_PS-1))])
+    // this macro does not get translated correctly because index must be usize
+    var sA = matrix.dmat;
+    const D_PS = cblasfeo.D_PS;
+    const ai = ai_ + matrix.row_start;
+    const aj = aj_ + matrix.col_start;
+    return (sA.pA[@intCast(usize, ((ai) - ((ai) & (D_PS - 1))) * sA.cn + (aj) * D_PS + ((ai) & (D_PS - 1)))]);
+}
+
+pub fn print_mat(matrix: Matrix) void {
+    cblasfeo.blasfeo_print_dmat(matrix.rows, matrix.cols, matrix.dmat, matrix.row_start, matrix.col_start);
+}
+
+pub fn print_vec(vector: Vector) void {
+    cblasfeo.blasfeo_print_dvec(vector.len, vector.dvec, vector.start);
+}
+
+pub fn vecel(vector: Vector, ai_: c_int) f64 {
+    // manual translation of DMATEL under MF_PANELMAJ & LA_HIGH_PERFORMANCE
+    // #define BLASFEO_DVECEL(sa,ai) ((sa)->pa[ai])
+    // this macro does not get translated correctly because index must be usize
+    var sa = vector.dvec;
+    const ai = ai_ + vector.start;
+    return sa.pa[@intCast(usize, ai)];
+}
+
+pub fn setId(m: Matrix) void {
+    gese(0.0, m);
+    diare(1.0, m);
+}
+
+pub fn isMatEq(m1: Matrix, m2: Matrix, tol: f64) bool {
+    if (m1.rows != m2.rows) return false;
+    if (m1.cols != m2.cols) return false;
+
+    var c: c_int = 0;
+    while (c < m1.cols) : (c += 1) {
+        var r: c_int = 0;
+        while (r < m1.rows) : (r += 1) {
+            if (@fabs(matel(m1, r, c) - matel(m2, r, c)) > tol) return false;
+        }
+    }
+    return true;
+}
+
+pub fn isVecEq(v1: Vector, v2: Vector, tol: f64) bool {
+    if (v1.len != v2.len) return false;
+
+    var c: c_int = 0;
+    while (c < v1.len) : (c += 1) {
+        if (@fabs(vecel(v1, c) - vecel(v2, c)) > tol) return false;
+    }
+    return true;
+}
+
+pub fn trace(matrix: Matrix) f64 {
+    var result: f64 = 0;
+    var idx: c_int = 0;
+    while (idx < @minimum(matrix.rows, matrix.cols)) : (idx += 1) {
+        result += matel(matrix, idx, idx);
+    }
+    return result;
+}
+
+pub fn diagonalProduct(matrix: Matrix) f64 {
+    var result: f64 = 1;
+    var idx: c_int = 0;
+    while (idx < @minimum(matrix.rows, matrix.cols)) : (idx += 1) {
+        result *= matel(matrix, idx, idx);
+    }
+    return result;
+}
 
 pub fn memsize_mat(m: c_int, n: c_int) usize {
     return cblasfeo.blasfeo_memsize_dmat(m, n);
@@ -74,7 +168,7 @@ pub fn vecmuldot(x: Vector, y: Vector, z: Vector) f64 {
     cblasfeo.blasfeo_dvecmuldot(x.len, x.dvec, x.start, y.dvec, y.start, z.dvec, z.start);
 }
 pub fn dot(x: Vector, y: Vector) f64 {
-    cblasfeo.blasfeo_ddot(x.len, x.dvec, x.start, y.dvec, y.start);
+    return cblasfeo.blasfeo_ddot(x.len, x.dvec, x.start, y.dvec, y.start);
 }
 pub fn rotg(a: f64, b: f64, c: *f64, s: *f64) void {
     cblasfeo.blasfeo_drotg(a, b, c, s);
@@ -158,7 +252,8 @@ pub fn gemm_nt(alpha: f64, A: Matrix, B: Matrix, beta: f64, C: Matrix, D: Matrix
     cblasfeo.blasfeo_dgemm_nt(A.rows, A.cols, D.cols, alpha, A.dmat, A.row_start, A.col_start, B.dmat, B.row_start, B.col_start, beta, C.dmat, C.row_start, C.col_start, D.dmat, D.row_start, D.col_start);
 }
 pub fn gemm_tn(alpha: f64, A: Matrix, B: Matrix, beta: f64, C: Matrix, D: Matrix) void {
-    cblasfeo.blasfeo_dgemm_tn(A.rows, A.cols, D.cols, alpha, A.dmat, A.row_start, A.col_start, B.dmat, B.row_start, B.col_start, beta, C.dmat, C.row_start, C.col_start, D.dmat, D.row_start, D.col_start);
+    // todo: Is this right?
+    cblasfeo.blasfeo_dgemm_tn(D.rows, D.cols, A.cols, alpha, A.dmat, A.row_start, A.col_start, B.dmat, B.row_start, B.col_start, beta, C.dmat, C.row_start, C.col_start, D.dmat, D.row_start, D.col_start);
 }
 pub fn gemm_tt(alpha: f64, A: Matrix, B: Matrix, beta: f64, C: Matrix, D: Matrix) void {
     cblasfeo.blasfeo_dgemm_tt(A.rows, A.cols, D.cols, alpha, A.dmat, A.row_start, A.col_start, B.dmat, B.row_start, B.col_start, beta, C.dmat, C.row_start, C.col_start, D.dmat, D.row_start, D.col_start);
@@ -336,6 +431,7 @@ pub fn pack_u_dmat(A: *f64, lda: c_int, B: Matrix) void {
     cblasfeo.blasfeo_pack_u_dmat(B.rows, B.cols, A, lda, B.dmat, B.row_start, B.col_start);
 }
 pub fn pack_tran_dmat(A: *f64, lda: c_int, B: Matrix) void {
+    // todo: fixme, something is wrong about order of rows and cols?
     cblasfeo.blasfeo_pack_tran_dmat(B.rows, B.cols, A, lda, B.dmat, B.row_start, B.col_start);
 }
 pub fn pack_dvec(x: *f64, xi: c_int, y: Vector) void {
@@ -350,141 +446,230 @@ pub fn unpack_tran_dmat(A: Matrix, B: *f64, ldb: c_int) void {
 pub fn unpack_dvec(x: Vector, y: *f64, yi: c_int) void {
     cblasfeo.blasfeo_unpack_dvec(x.len, x.dvec, x.start, y, yi);
 }
-pub fn dgese(alpha: f64, A: Matrix) void {
+pub fn gese(alpha: f64, A: Matrix) void {
     cblasfeo.blasfeo_dgese(A.rows, A.cols, alpha, A.dmat, A.row_start, A.col_start);
 }
-pub fn dgecp(A: Matrix, B: Matrix) void {
+pub fn gecp(A: Matrix, B: Matrix) void {
     cblasfeo.blasfeo_dgecp(A.rows, A.cols, A.dmat, A.row_start, A.col_start, B.dmat, B.row_start, B.col_start);
 }
-pub fn dgesc(alpha: f64, A: Matrix) void {
+pub fn gesc(alpha: f64, A: Matrix) void {
     cblasfeo.blasfeo_dgesc(A.rows, A.cols, alpha, A.dmat, A.row_start, A.col_start);
 }
-pub fn dgecpsc(alpha: f64, A: Matrix, B: Matrix) void {
+pub fn gecpsc(alpha: f64, A: Matrix, B: Matrix) void {
     cblasfeo.blasfeo_dgecpsc(A.rows, A.cols, alpha, A.dmat, A.row_start, A.col_start, B.dmat, B.row_start, B.col_start);
 }
-pub fn dtrcp_l(A: Matrix, B: Matrix) void {
+pub fn trcp_l(A: Matrix, B: Matrix) void {
     cblasfeo.blasfeo_dtrcp_l(A.rows, A.dmat, A.row_start, A.col_start, B.dmat, B.row_start, B.col_start);
 }
-pub fn dtrcpsc_l(alpha: f64, A: Matrix, B: Matrix) void {
+pub fn trcpsc_l(alpha: f64, A: Matrix, B: Matrix) void {
     cblasfeo.blasfeo_dtrcpsc_l(A.rows, alpha, A.dmat, A.row_start, A.col_start, B.dmat, B.row_start, B.col_start);
 }
-pub fn dtrsc_l(alpha: f64, A: Matrix) void {
+pub fn trsc_l(alpha: f64, A: Matrix) void {
     cblasfeo.blasfeo_dtrsc_l(A.rows, alpha, A.dmat, A.row_start, A.col_start);
 }
-pub fn dgead(alpha: f64, A: Matrix, B: Matrix) void {
+pub fn gead(alpha: f64, A: Matrix, B: Matrix) void {
     cblasfeo.blasfeo_dgead(A.rows, A.cols, alpha, A.dmat, A.row_start, A.col_start, B.dmat, B.row_start, B.col_start);
 }
-pub fn dvecad(alpha: f64, x: Vector, y: Vector) void {
+pub fn vecad(alpha: f64, x: Vector, y: Vector) void {
     cblasfeo.blasfeo_dvecad(x.len, alpha, x.dvec, x.start, y.dvec, y.start);
 }
-pub fn dgetr(A: Matrix, B: Matrix) void {
+pub fn getr(A: Matrix, B: Matrix) void {
     cblasfeo.blasfeo_dgetr(A.rows, A.cols, A.dmat, A.row_start, A.col_start, B.dmat, B.row_start, B.col_start);
 }
-pub fn dtrtr_l(A: Matrix, B: Matrix) void {
+pub fn trtr_l(A: Matrix, B: Matrix) void {
     cblasfeo.blasfeo_dtrtr_l(A.rows, A.dmat, A.row_start, A.col_start, B.dmat, B.row_start, B.col_start);
 }
-pub fn dtrtr_u(A: Matrix, B: Matrix) void {
+pub fn trtr_u(A: Matrix, B: Matrix) void {
     cblasfeo.blasfeo_dtrtr_u(A.rows, A.dmat, A.row_start, A.col_start, B.dmat, B.row_start, B.col_start);
 }
-pub fn ddiare(alpha: f64, A: Matrix) void {
+pub fn diare(alpha: f64, A: Matrix) void {
     cblasfeo.blasfeo_ddiare(A.rows, alpha, A.dmat, A.row_start, A.col_start);
 }
-pub fn ddiain(alpha: f64, x: Vector, A: Matrix) void {
+pub fn diain(alpha: f64, x: Vector, A: Matrix) void {
     cblasfeo.blasfeo_ddiain(A.rows, alpha, x.dvec, x.start, A.dmat, A.row_start, A.col_start);
 }
-pub fn ddiain_sp(alpha: f64, x: Vector, idx: *c_int, D: Matrix) void {
+pub fn diain_sp(alpha: f64, x: Vector, idx: *c_int, D: Matrix) void {
     cblasfeo.blasfeo_ddiain_sp(D.rows, alpha, x.dvec, x.start, idx, D.dmat, D.row_start, D.col_start);
 }
-pub fn ddiaex(alpha: f64, A: Matrix, x: Vector) void {
+pub fn diaex(alpha: f64, A: Matrix, x: Vector) void {
     cblasfeo.blasfeo_ddiaex(A.rows, alpha, A.dmat, A.row_start, A.col_start, x.dvec, x.start);
 }
-pub fn ddiaex_sp(alpha: f64, idx: *c_int, D: Matrix, x: Vector) void {
+pub fn diaex_sp(alpha: f64, idx: *c_int, D: Matrix, x: Vector) void {
     cblasfeo.blasfeo_ddiaex_sp(D.rows, alpha, idx, D.dmat, D.row_start, D.col_start, x.dvec, x.start);
 }
-pub fn ddiaad(alpha: f64, x: Vector, A: Matrix) void {
+pub fn diaad(alpha: f64, x: Vector, A: Matrix) void {
     cblasfeo.blasfeo_ddiaad(A.rows, alpha, x.dvec, x.start, A.dmat, A.row_start, A.col_start);
 }
-pub fn ddiaad_sp(alpha: f64, x: Vector, idx: *c_int, D: Matrix) void {
+pub fn diaad_sp(alpha: f64, x: Vector, idx: *c_int, D: Matrix) void {
     cblasfeo.blasfeo_ddiaad_sp(D.rows, alpha, x.dvec, x.start, idx, D.dmat, D.row_start, D.col_start);
 }
-pub fn ddiaadin_sp(alpha: f64, x: Vector, y: Vector, idx: *c_int, D: Matrix) void {
+pub fn diaadin_sp(alpha: f64, x: Vector, y: Vector, idx: *c_int, D: Matrix) void {
     cblasfeo.blasfeo_ddiaadin_sp(D.rows, alpha, x.dvec, x.start, y.dvec, y.start, idx, D.dmat, D.row_start, D.col_start);
 }
-pub fn drowin(alpha: f64, x: Vector, A: Matrix) void {
+pub fn rowin(alpha: f64, x: Vector, A: Matrix) void {
     cblasfeo.blasfeo_drowin(A.rows, alpha, x.dvec, x.start, A.dmat, A.row_start, A.col_start);
 }
-pub fn drowex(alpha: f64, A: Matrix, x: Vector) void {
+pub fn rowex(alpha: f64, A: Matrix, x: Vector) void {
     cblasfeo.blasfeo_drowex(A.rows, alpha, A.dmat, A.row_start, A.col_start, x.dvec, x.start);
 }
-pub fn drowad(alpha: f64, x: Vector, A: Matrix) void {
+pub fn rowad(alpha: f64, x: Vector, A: Matrix) void {
     cblasfeo.blasfeo_drowad(A.rows, alpha, x.dvec, x.start, A.dmat, A.row_start, A.col_start);
 }
-pub fn drowad_sp(alpha: f64, x: Vector, idx: *c_int, D: Matrix) void {
+pub fn rowad_sp(alpha: f64, x: Vector, idx: *c_int, D: Matrix) void {
     cblasfeo.blasfeo_drowad_sp(D.rows, alpha, x.dvec, x.start, idx, D.dmat, D.row_start, D.col_start);
 }
-pub fn drowsw(A: Matrix, C: Matrix) void {
+pub fn rowsw(A: Matrix, C: Matrix) void {
     cblasfeo.blasfeo_drowsw(A.rows, A.dmat, A.row_start, A.col_start, C.dmat, C.row_start, C.col_start);
 }
-pub fn drowpe(ipiv: *c_int, A: Matrix) void {
+pub fn rowpe(ipiv: *c_int, A: Matrix) void {
     cblasfeo.blasfeo_drowpe(A.rows, ipiv, A.dmat);
 }
-pub fn drowpei(ipiv: *c_int, A: Matrix) void {
+pub fn rowpei(ipiv: *c_int, A: Matrix) void {
     cblasfeo.blasfeo_drowpei(A.rows, ipiv, A.dmat);
 }
-pub fn dcolex(A: Matrix, x: Vector) void {
+pub fn colex(A: Matrix, x: Vector) void {
     cblasfeo.blasfeo_dcolex(A.rows, A.dmat, A.row_start, A.col_start, x.dvec, x.start);
 }
-pub fn dcolin(x: Vector, A: Matrix) void {
+pub fn colin(x: Vector, A: Matrix) void {
     cblasfeo.blasfeo_dcolin(A.rows, x.dvec, x.start, A.dmat, A.row_start, A.col_start);
 }
-pub fn dcolad(alpha: f64, x: Vector, A: Matrix) void {
+pub fn colad(alpha: f64, x: Vector, A: Matrix) void {
     cblasfeo.blasfeo_dcolad(A.rows, alpha, x.dvec, x.start, A.dmat, A.row_start, A.col_start);
 }
-pub fn dcolsc(alpha: f64, A: Matrix) void {
+pub fn colsc(alpha: f64, A: Matrix) void {
     cblasfeo.blasfeo_dcolsc(A.rows, alpha, A.dmat, A.row_start, A.col_start);
 }
-pub fn dcolsw(A: Matrix, C: Matrix) void {
+pub fn colsw(A: Matrix, C: Matrix) void {
     cblasfeo.blasfeo_dcolsw(A.rows, A.dmat, A.row_start, A.col_start, C.dmat, C.row_start, C.col_start);
 }
-pub fn dcolpe(ipiv: *c_int, A: Matrix) void {
+pub fn colpe(ipiv: *c_int, A: Matrix) void {
     cblasfeo.blasfeo_dcolpe(A.rows, ipiv, A.dmat);
 }
-pub fn dcolpei(ipiv: *c_int, A: Matrix) void {
+pub fn colpei(ipiv: *c_int, A: Matrix) void {
     cblasfeo.blasfeo_dcolpei(A.rows, ipiv, A.dmat);
 }
-pub fn dvecse(alpha: f64, x: Vector) void {
+pub fn vecse(alpha: f64, x: Vector) void {
     cblasfeo.blasfeo_dvecse(x.len, alpha, x.dvec, x.start);
 }
-pub fn dveccp(x: Vector, y: Vector) void {
+pub fn veccp(x: Vector, y: Vector) void {
     cblasfeo.blasfeo_dveccp(x.len, x.dvec, x.start, y.dvec, y.start);
 }
-pub fn dvecsc(alpha: f64, x: Vector) void {
+pub fn vecsc(alpha: f64, x: Vector) void {
     cblasfeo.blasfeo_dvecsc(x.len, alpha, x.dvec, x.start);
 }
-pub fn dveccpsc(alpha: f64, x: Vector, y: Vector) void {
+pub fn veccpsc(alpha: f64, x: Vector, y: Vector) void {
     cblasfeo.blasfeo_dveccpsc(x.len, alpha, x.dvec, x.start, y.dvec, y.start);
 }
-pub fn dvecad_sp(alpha: f64, x: Vector, idx: *c_int, z: Vector) void {
+pub fn vecad_sp(alpha: f64, x: Vector, idx: *c_int, z: Vector) void {
     cblasfeo.blasfeo_dvecad_sp(x.len, alpha, x.dvec, x.start, idx, z.dvec, z.start);
 }
-pub fn dvecin_sp(alpha: f64, x: Vector, idx: *c_int, z: Vector) void {
+pub fn vecin_sp(alpha: f64, x: Vector, idx: *c_int, z: Vector) void {
     cblasfeo.blasfeo_dvecin_sp(x.len, alpha, x.dvec, x.start, idx, z.dvec, z.start);
 }
-pub fn dvecex_sp(alpha: f64, idx: *c_int, x: Vector, z: Vector) void {
+pub fn vecex_sp(alpha: f64, idx: *c_int, x: Vector, z: Vector) void {
     cblasfeo.blasfeo_dvecex_sp(x.len, alpha, idx, x.dvec, x.start, z.dvec, z.start);
 }
-pub fn dvecexad_sp(alpha: f64, idx: *c_int, x: Vector, z: Vector) void {
+pub fn vecexad_sp(alpha: f64, idx: *c_int, x: Vector, z: Vector) void {
     cblasfeo.blasfeo_dvecexad_sp(x.len, alpha, idx, x.dvec, x.start, z.dvec, z.start);
 }
-pub fn dvecze(m: Vector, v: Vector, e: Vector) void {
+pub fn vecze(m: Vector, v: Vector, e: Vector) void {
     cblasfeo.blasfeo_dvecze(m.len, m.dvec, m.start, v.dvec, v.start, e.dvec, e.start);
 }
-pub fn dvecnrm_inf(x: Vector, ptr_norm: *f64) void {
+pub fn vecnrm_inf(x: Vector, ptr_norm: *f64) void {
     cblasfeo.blasfeo_dvecnrm_inf(x.len, x.dvec, x.start, ptr_norm);
 }
-pub fn dvecpe(ipiv: *c_int, x: Vector) void {
+pub fn vecpe(ipiv: *c_int, x: Vector) void {
     cblasfeo.blasfeo_dvecpe(x.len, ipiv, x.dvec, x.start);
 }
-pub fn dvecpei(ipiv: *c_int, x: Vector) void {
+pub fn vecpei(ipiv: *c_int, x: Vector) void {
     cblasfeo.blasfeo_dvecpei(x.len, ipiv, x.dvec, x.start);
 }
+
+pub const Arena = struct {
+    const Self = @This();
+    const UNINTIALIZED: [0]u8 = .{};
+    const ARENA_SIZE_KB = 16;
+
+    env_stack: std.ArrayList(usize),
+    allocator: std.mem.Allocator,
+    bytes: []u8 align(CACHE_LINE_SIZE) = UNINTIALIZED[0..],
+    bytes_used: usize = 0,
+    bytes_allocated: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator) Self {
+        var result = Self{ .env_stack = std.ArrayList(usize).init(allocator), .allocator = allocator };
+        return result;
+    }
+
+    // bump allocate a number of bytes, aligned to cache
+    pub fn alloc(self: *Self, num_bytes: usize) ![]align(CACHE_LINE_SIZE) u8 {
+        if (!self.bytes_allocated) {
+            self.bytes = try self.allocator.alignedAlloc(u8, CACHE_LINE_SIZE, 1024 * ARENA_SIZE_KB);
+            self.bytes_allocated = true;
+        }
+
+        // round up to multiple of cache line size
+        var num_bytes_aligned = @divFloor(num_bytes, CACHE_LINE_SIZE) * CACHE_LINE_SIZE;
+
+        if (num_bytes % CACHE_LINE_SIZE != 0) {
+            num_bytes_aligned += CACHE_LINE_SIZE;
+        }
+
+        std.debug.assert(num_bytes_aligned != 0);
+
+        const start_byte = self.bytes_used;
+        self.bytes_used += num_bytes_aligned;
+        if (self.bytes_used >= self.bytes.len) {
+            return error.OutOfMemory;
+        }
+
+        // assert alignment to cache line
+        std.debug.assert(@ptrToInt(&self.bytes[start_byte]) % CACHE_LINE_SIZE == 0);
+
+        var result: []align(CACHE_LINE_SIZE) u8 = @alignCast(CACHE_LINE_SIZE, self.bytes[start_byte..]);
+        result.len = num_bytes;
+
+        return result;
+    }
+
+    pub fn pushEnv(self: *Self) !void {
+        try self.env_stack.append(self.bytes_used);
+    }
+
+    pub fn popEnv(self: *Self) void {
+        std.debug.assert(self.env_stack.items.len >= 1);
+        const last_env = self.env_stack.pop();
+        self.bytes_used = last_env;
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.env_stack.deinit();
+        if (self.bytes_allocated) {
+            self.allocator.free(self.bytes);
+        }
+    }
+
+    pub fn matrix(self: *Self, rows: c_int, cols: c_int) !Matrix {
+        const checkpoint = self.bytes_used;
+        errdefer self.bytes_used = checkpoint;
+
+        const header_memsize: usize = @sizeOf(Dmat);
+        const storage_memsize: usize = memsize_mat(rows, cols);
+        const header_bytes = try self.alloc(header_memsize);
+        const storage_bytes = try self.alloc(storage_memsize);
+        create_dmat(rows, cols, @ptrCast(*Dmat, header_bytes.ptr), storage_bytes.ptr);
+        return Matrix.attach(@ptrCast(*Dmat, header_bytes.ptr));
+    }
+
+    pub fn vector(self: *Self, len: c_int) !Vector {
+        const checkpoint = self.bytes_used;
+        errdefer self.bytes_used = checkpoint;
+
+        const header_memsize: usize = @sizeOf(Dvec);
+        const storage_memsize: usize = memsize_vec(len);
+        const header_bytes = try self.alloc(header_memsize);
+        const storage_bytes = try self.alloc(storage_memsize);
+        create_dvec(len, @ptrCast(*Dvec, header_bytes.ptr), storage_bytes.ptr);
+        return Vector.attach(@ptrCast(*Dvec, header_bytes.ptr));
+    }
+};
