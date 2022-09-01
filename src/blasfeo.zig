@@ -153,8 +153,7 @@ pub fn memsize_vec(m: c_int) usize {
 }
 
 pub fn pack_tran_dmat(A: *f64, lda: c_int, B: Matrix) void {
-    // todo: fixme, is something wrong about order of rows and cols?
-    cblasfeo.blasfeo_pack_tran_dmat(B.rows, B.cols, A, lda, B.dmat, B.row_start, B.col_start);
+    cblasfeo.blasfeo_pack_tran_dmat(B.cols, B.rows, A, lda, B.dmat, B.row_start, B.col_start);
 }
 
 pub fn pack_dvec(x: *f64, xi: c_int, y: Vector) void {
