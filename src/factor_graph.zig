@@ -1,5 +1,6 @@
 const std = @import("std");
 const blasfeo = @import("blasfeo.zig");
+const upq = @import("upriority_queue.zig");
 
 pub fn removeConst(comptime T: type, ptr: *const T) *T {
     return @intToPtr(*T, @ptrToInt(ptr));
@@ -68,7 +69,6 @@ const FactorGraph = struct {
         id: usize,
         dim : c_int,
         cov_det : f64 = 0,
-        kl_divergence : f64 = 0,
         mean_dvec: blasfeo.Dvec = undefined,
         cov_dmat: blasfeo.Dmat = undefined,
         info_dvec: blasfeo.Dvec = undefined,
@@ -98,7 +98,7 @@ const FactorGraph = struct {
             return blasfeo.Matrix.attach(&self.prior_info_dmat);
         }
 
-        pub fn init(self: *Variable, prior_mean : []const f64, prior_cov : []const f64) !void {
+        pub fn initWithSlice(self: *Variable, prior_mean : []const f64, prior_cov : []const f64) !void {
             const dim = self.dim;
             std.debug.assert(prior_mean.len == dim);
             std.debug.assert(prior_cov.len == dim*dim);
@@ -130,7 +130,7 @@ const FactorGraph = struct {
             blasfeo.gecp(vprior_info_mat, vinfo_mat);
         }
 
-        pub fn fixMeanCovKl(self: *Variable) !void {
+        pub fn fixMeanCovKl(self: *Variable) !f64 {
             // after updating the info mat and info vec
             // call this function to update the mean, cov, and kl
             // convert from info form to covariance form
@@ -161,12 +161,13 @@ const FactorGraph = struct {
             const ln_covdet_ratio = std.math.ln(covdet_ratio);
 
             const kl = 0.5 * (ln_covdet_ratio - @intToFloat(f64, self.dim) + deltat_infoq_delta + tr_infoq_sigmap);
-            self.kl_divergence = kl;
             self.cov_det = new_cov_det;
             blasfeo.veccp(new_mean, self.mean());
             blasfeo.gecp(new_cov, self.cov());
 
             self.needs_fix = false;
+
+            return kl;
         }
     };
 
@@ -307,6 +308,7 @@ const FactorGraph = struct {
     factors: std.ArrayList(Factor),
     factor_slots: std.ArrayList(FactorSlot),
     variables: std.ArrayList(Variable),
+    priority_queue: upq.UPriorityQueue, // -kl divergence of variables
     propagate_variable_tmp: std.ArrayList(usize),
 
     pub fn init(allocator: std.mem.Allocator) Self {
@@ -316,6 +318,7 @@ const FactorGraph = struct {
         self.factor_slots = std.ArrayList(FactorSlot).init(allocator);
         self.variables = std.ArrayList(Variable).init(allocator);
         self.propagate_variable_tmp = std.ArrayList(usize).init(allocator);
+        self.priority_queue = upq.UPriorityQueue.init(allocator);
         return self;
     }
 
@@ -323,6 +326,7 @@ const FactorGraph = struct {
         self.factors.deinit();
         self.factor_slots.deinit();
         self.variables.deinit();
+        self.priority_queue.deinit();
         self.propagate_variable_tmp.deinit();
     }
 
@@ -349,6 +353,10 @@ const FactorGraph = struct {
         }
 
         try self.variables.append(variable);
+        errdefer _ = self.variables.pop();
+
+        try self.priority_queue.add(variable.id, -std.math.f64_max);
+
         return &self.variables.items[self.variables.items.len - 1];
     }
 
@@ -456,6 +464,13 @@ const FactorGraph = struct {
         return &self.factors.items[factor.id];
     }
 
+    pub fn iterate(self: *Self) !void {
+        if (self.priority_queue.peek()) |priority| {
+            std.debug.print("Propagating {s}\n", .{priority});
+            try self.propagateVariable(priority.id);
+        }
+    }
+
     pub fn propagateVariable(self: *Self, variable_id: usize) !void {
         defer self.propagate_variable_tmp.clearRetainingCapacity();
 
@@ -544,7 +559,8 @@ const FactorGraph = struct {
         for (self.propagate_variable_tmp.items) |vid| {
             // std.debug.print("Fixing {d}\n", .{vid});
             var v = &self.variables.items[vid];
-            try v.fixMeanCovKl();
+            const kl_divergence = try v.fixMeanCovKl();
+            try self.priority_queue.update(vid, -kl_divergence);
         }
     }
 };
@@ -632,7 +648,7 @@ test "variable init" {
     };
     // zig fmt: on
 
-    try v0.init(mean[0..], cov[0..]);
+    try v0.initWithSlice(mean[0..], cov[0..]);
 
     // test mean and cov set properly
     var vmean = v0.mean();
@@ -717,7 +733,7 @@ test "propagate two variables" {
             0.01,  0.0,
             0.0, 100.0
         };
-        try v0.init(mean[0..], cov[0..]);
+        try v0.initWithSlice(mean[0..], cov[0..]);
     }
 
     {
@@ -726,7 +742,7 @@ test "propagate two variables" {
             100.0, 0.00,
              0.0,  0.01
         };
-        try v1.init(mean[0..], cov[0..]);
+        try v1.initWithSlice(mean[0..], cov[0..]);
     }
 
     // add a factor that brings these variables equal
@@ -768,18 +784,19 @@ test "propagate two variables" {
     var it: usize = 0;
     while (it < 10) : (it += 1) {
         std.debug.print("it {d}\n", .{it});
-        try graph.propagateVariable(v0.id);
-        try graph.propagateVariable(v1.id);
+        try graph.iterate();
+        // try graph.propagateVariable(v0.id);
+        // try graph.propagateVariable(v1.id);
         std.debug.print("New v0 mean\n", .{});
         blasfeo.print_vec(v0.mean());
         // std.debug.print("New v0 cov\n", .{});
         // blasfeo.print_mat(v0.cov());
-        std.debug.print("kl v0: {d}\n", .{v0.kl_divergence});
+        // std.debug.print("kl v0: {d}\n", .{v0.kl_divergence});
         std.debug.print("New v1 mean\n", .{});
         blasfeo.print_vec(v1.mean());
         // std.debug.print("New v1 cov\n", .{});
         // blasfeo.print_mat(v1.cov());
-        std.debug.print("kl v1: {d}\n", .{v1.kl_divergence});
+        // std.debug.print("kl v1: {d}\n", .{v1.kl_divergence});
         // std.debug.print("Cov dets {d} {d}\n", .{ v0.cov_det, v1.cov_det });
     }
     std.debug.print("New v0 mean\n", .{});
@@ -789,4 +806,21 @@ test "propagate two variables" {
 
     // std.debug.print("New v0 cov\n", .{});
     // blasfeo.print_mat(v0.cov());
+}
+
+test "set from slice" {
+    try ARENA.pushEnv();
+    defer ARENA.popEnv();
+
+    // zig fmt: off
+    const data = [_]f64{
+        1, 2, 3, 4, 5,
+        6, 7, 8, 9, 10
+    };
+    // zig fmt: on
+
+    var matrix = try ARENA.matrix(2, 5);
+    matrix.setFromSlice(data[0..]);
+
+    blasfeo.print_mat(matrix);
 }
